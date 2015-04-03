@@ -127,7 +127,10 @@ class SyntheyesActions(HookBaseClass):
             raise Exception("File not found on disk - '%s'" % path)
 
         hlev = get_existing_connection()
-        hlev.NewSceneAndShot(path)
+        hlev.AddShot(path)
+
+    # TODO: AddStereoShot
+    # TODO: AddSurveyShot
 
     def _do_import_mesh(self, path, sg_publish_data):
         """
