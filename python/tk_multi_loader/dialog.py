@@ -1,4 +1,4 @@
-# Copyright (c) 2013 Shotgun Software Inc.
+# Copyright (c) 2015 Shotgun Software Inc.
 #
 # CONFIDENTIAL AND PROPRIETARY
 #
@@ -18,9 +18,11 @@ from .model_publishtype import SgPublishTypeModel
 from .model_status import SgStatusModel
 from .proxymodel_latestpublish import SgLatestPublishProxyModel
 from .proxymodel_entity import SgEntityProxyModel
-from .delegate_publish_thumb import SgPublishDelegate
+from .delegate_publish_thumb import SgPublishThumbDelegate
+from .delegate_publish_list import SgPublishListDelegate
 from .model_publishhistory import SgPublishHistoryModel
 from .delegate_publish_history import SgPublishHistoryDelegate
+from .search_widget import SearchWidget
 
 from .ui.dialog import Ui_Dialog
 
@@ -33,6 +35,9 @@ class AppDialog(QtGui.QWidget):
     """
     Main dialog window for the App
     """
+
+    # enum to control the mode of the main view
+    (MAIN_VIEW_LIST, MAIN_VIEW_THUMB) = range(2)
 
     # signal emitted whenever the selected publish changes
     # in either the main view or the details history view
@@ -57,7 +62,7 @@ class AppDialog(QtGui.QWidget):
         # set up the UI
         self.ui = Ui_Dialog()
         self.ui.setupUi(self)
-
+        
         #################################################
         # maintain a list where we keep a reference to
         # all the dynamic UI we create. This is to make
@@ -81,6 +86,9 @@ class AppDialog(QtGui.QWidget):
         self.ui.detail_actions_btn.setMenu(self._details_action_menu)
 
         self.ui.info.clicked.connect(self._toggle_details_pane)
+
+        self.ui.thumbnail_mode.clicked.connect(self._on_thumbnail_mode_clicked)
+        self.ui.list_mode.clicked.connect(self._on_list_mode_clicked)
 
         self._publish_history_model = SgPublishHistoryModel(self, self.ui.history_view)
 
@@ -149,9 +157,14 @@ class AppDialog(QtGui.QWidget):
         # hook up view -> proxy model -> model
         self.ui.publish_view.setModel(self._publish_proxy_model)
 
-        # tell our publish view to use a custom delegate to produce widgetry
-        self._publish_delegate = SgPublishDelegate(self.ui.publish_view, self._status_model, self._action_manager)
-        self.ui.publish_view.setItemDelegate(self._publish_delegate)
+        # set up custom delegates to use when drawing the main area
+        self._publish_thumb_delegate = SgPublishThumbDelegate(self.ui.publish_view, self._action_manager)
+
+        self._publish_list_delegate = SgPublishListDelegate(self.ui.publish_view, self._action_manager)
+        
+        # recall which the most recently mode used was and set that
+        main_view_mode = self._settings_manager.retrieve("main_view_mode", self.MAIN_VIEW_THUMB)
+        self._set_main_view_mode(main_view_mode)
 
         # whenever the type list is checked, update the publish filters
         self._publish_type_model.itemChanged.connect(self._apply_type_filters_on_publishes)
@@ -171,6 +184,23 @@ class AppDialog(QtGui.QWidget):
         self._refresh_action.triggered.connect(self._publish_model.async_refresh)
         self.ui.publish_view.addAction(self._refresh_action)
         self.ui.publish_view.setContextMenuPolicy(QtCore.Qt.ActionsContextMenu)
+
+        #################################################
+        # popdown publish filter widget for the main view
+        # note:
+        # we parent the widget to a frame that flows around the 
+        # main publish area - this is in order to avoid a scenario
+        # where the overlay that sometimes pops up on top of the 
+        # publish area and the search widget would be competing
+        # for the same z-index. The result in some of these cases 
+        # is that the search widget is hidden under the "publishes
+        # not found" overlay. By having it parented to the frame 
+        # instead, it will always be above the overlay.
+        self._search_widget = SearchWidget(self.ui.publish_frame)
+        # hook it up with the search button the main toolbar
+        self.ui.search_publishes.clicked.connect(self._on_publish_filter_clicked)
+        # hook it up so that it signals the publish proxy model whenever the filter changes
+        self._search_widget.filter_changed.connect(self._publish_proxy_model.set_search_query)
 
         #################################################
         # checkboxes, buttons etc
@@ -281,7 +311,7 @@ class AppDialog(QtGui.QWidget):
         Executed when the main dialog is closed.
         All worker threads and other things which need a proper shutdown
         need to be called here.
-        """
+        """        
         # display exit splash screen
         splash_pix = QtGui.QPixmap(":/res/exit_splash.png")
         splash = QtGui.QSplashScreen(splash_pix, QtCore.Qt.WindowStaysOnTopHint)
@@ -293,8 +323,12 @@ class AppDialog(QtGui.QWidget):
             # clear the selection in the main views. 
             # this is to avoid re-triggering selection
             # as items are being removed in the models
-            self._history_view_selection_model.clear()
-            self._publish_view_selection_model.clear()
+            #
+            # note that we pull out a fresh handle to the selection model
+            # as these objects sometimes are deleted internally in the view
+            # and therefore persisting python handles may not be valid 
+            self.ui.history_view.selectionModel().clear()
+            self.ui.publish_view.selectionModel().clear()        
             
             # disconnect some signals so we don't go all crazy when
             # the cascading model deletes begin as part of the destroy calls
@@ -366,6 +400,57 @@ class AppDialog(QtGui.QWidget):
                                                                              self._action_manager.UI_AREA_HISTORY)
         if default_action:
             default_action.trigger()
+
+    def _on_publish_filter_clicked(self):
+        """
+        Executed when someone clicks the filter button in the main UI
+        """        
+        if self.ui.search_publishes.isChecked():
+            self.ui.search_publishes.setIcon(QtGui.QIcon(QtGui.QPixmap(":/res/search_active.png")))
+            self._search_widget.enable()
+        else:
+            self.ui.search_publishes.setIcon(QtGui.QIcon(QtGui.QPixmap(":/res/search.png")))
+            self._search_widget.disable()
+
+    def _on_thumbnail_mode_clicked(self):
+        """
+        Executed when someone clicks the thumbnail mode button
+        """
+        self._set_main_view_mode(self.MAIN_VIEW_THUMB)
+        
+    def _on_list_mode_clicked(self):
+        """
+        Executed when someone clicks the list mode button
+        """
+        self._set_main_view_mode(self.MAIN_VIEW_LIST)
+
+    def _set_main_view_mode(self, mode):
+        """
+        Sets up the view mode for the main view.
+        
+        :param mode: either MAIN_VIEW_LIST or MAIN_VIEW_THUMB
+        """
+        if mode == self.MAIN_VIEW_LIST:
+            self.ui.list_mode.setIcon(QtGui.QIcon(QtGui.QPixmap(":/res/mode_switch_card_active.png")))
+            self.ui.list_mode.setChecked(True)
+            self.ui.thumbnail_mode.setIcon(QtGui.QIcon(QtGui.QPixmap(":/res/mode_switch_thumb.png")))
+            self.ui.thumbnail_mode.setChecked(False)
+            self.ui.publish_view.setViewMode(QtGui.QListView.ListMode)
+            self.ui.publish_view.setItemDelegate(self._publish_list_delegate)            
+            
+        elif mode == self.MAIN_VIEW_THUMB:
+            self.ui.list_mode.setIcon(QtGui.QIcon(QtGui.QPixmap(":/res/mode_switch_card.png")))
+            self.ui.list_mode.setChecked(False)
+            self.ui.thumbnail_mode.setIcon(QtGui.QIcon(QtGui.QPixmap(":/res/mode_switch_thumb_active.png")))
+            self.ui.thumbnail_mode.setChecked(True)
+            self.ui.publish_view.setViewMode(QtGui.QListView.IconMode)
+            self.ui.publish_view.setItemDelegate(self._publish_thumb_delegate)
+            
+        else:
+            raise TankError("Undefined view mode!") 
+
+        self.ui.publish_view.selectionModel().clear()
+        self._settings_manager.store("main_view_mode", mode)
 
     def _toggle_details_pane(self):
         """
@@ -1282,14 +1367,17 @@ class AppDialog(QtGui.QWidget):
             if len(child_folders) > 0:
                 # delegates are rendered in a special way
                 # if we are on a non-leaf node in the tree (e.g there are subfolders)
-                self._publish_delegate.show_entity_instead_of_type(True)
+                self._publish_thumb_delegate.set_sub_items_mode(True)
+                self._publish_list_delegate.set_sub_items_mode(True)
             else:
                 # we are at leaf level and the subitems check box is checked
                 # render the cells
-                self._publish_delegate.show_entity_instead_of_type(False)
+                self._publish_thumb_delegate.set_sub_items_mode(False)
+                self._publish_list_delegate.set_sub_items_mode(False)
         else:
             self.ui.publish_view.setStyleSheet("")
-            self._publish_delegate.show_entity_instead_of_type(False)
+            self._publish_thumb_delegate.set_sub_items_mode(False)
+            self._publish_list_delegate.set_sub_items_mode(False)
 
         # now finally load up the data in the publish model
         publish_filters = self._entity_presets[self._current_entity_preset].publish_filters
